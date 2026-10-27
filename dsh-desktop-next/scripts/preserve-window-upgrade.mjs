@@ -5,8 +5,14 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { tree } from './portable-upgrade.mjs'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+if (['doctor', 'package', 'install', 'rollback', 'tools', 'recover'].includes(process.argv[2])) {
+  const { main } = await import('./upgrade-cli.mjs')
+  try { main() } catch (error) { console.error(error.message); process.exitCode = 1 }
+  process.exit(process.exitCode ?? 0)
+}
 const baseFile = 'dsh-desktop-next/window-feature-base.json'
 const base = JSON.parse(readFileSync(join(repo, baseFile), 'utf8')).upstreamRevision
 if (!/^[0-9a-f]{40}$/u.test(base)) throw new Error('Invalid feature base revision')
@@ -93,11 +99,16 @@ for (const relative of ['node_modules', 'dsh-desktop-next/node_modules']) {
 }
 const test = run(process.execPath, [join(repo, 'node_modules/vitest/vitest.mjs'), 'run', '--config', 'vitest.config.ts',
   'tests/window-identities.spec.ts', 'tests/window-control.spec.ts', 'tests/app-windows.spec.ts', 'tests/main-lifecycle.spec.ts',
-  'tests/keyboard.spec.ts', 'tests/native-notifications.spec.ts', 'tests/web-document.spec.ts', 'tests/app-downloads.spec.ts', 'tests/electron-permissions.spec.ts'], join(checkout, 'dsh-desktop-next'))
+  'tests/keyboard.spec.ts', 'tests/native-notifications.spec.ts', 'tests/web-document.spec.ts', 'tests/app-downloads.spec.ts', 'tests/electron-permissions.spec.ts', 'tests/portable-upgrade.spec.ts', 'tests/portable-asar.spec.ts'], join(checkout, 'dsh-desktop-next'))
 writeFileSync(join(out, 'tests.log'), test.stdout + test.stderr)
 if (test.status !== 0) { manifest.state = 'check_failed'; save(); console.log(JSON.stringify({ directory: out, ...manifest })); process.exit(5) }
 const build = run(process.execPath, [join(repo, 'node_modules/tsdown/dist/run.mjs'), '--cwd', 'dsh-desktop-next'], checkout)
 writeFileSync(join(out, 'build.log'), build.stdout + build.stderr)
+if (build.status === 0) {
+  manifest.checkedSources = tree(join(checkout, 'dsh-desktop-next/src'))
+  manifest.checkedModules = tree(join(checkout, 'dsh-desktop-next/lib'))
+  manifest.checkedScripts = tree(join(checkout, 'dsh-desktop-next/scripts'))
+}
 manifest.state = build.status === 0 ? 'source_checks_passed_native_install_pending' : 'build_failed'; save()
 console.log(JSON.stringify({ directory: out, ...manifest }))
 process.exitCode = build.status === 0 ? 0 : 6

@@ -5,6 +5,7 @@ import { createConnection } from 'node:net'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { dataHome } from './window-locations.mjs'
 
 const actor = process.env.CODEX_THREAD_ID
 if (!actor || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(actor)) {
@@ -30,14 +31,7 @@ if (action === 'fill') {
   request.text = readFileSync(0, 'utf8') // No draft text in process arguments or clipboard.
   if (Buffer.byteLength(request.text) > 100_000) throw new Error('Input is too large')
 }
-let home = process.env.DSH_WINDOW_HOME
-if (!home) {
-  let location
-  try { location = JSON.parse(readFileSync(join(homedir(), 'Library/Application Support/DSH NEXT/home/desktop-next-location.json'), 'utf8')).home }
-  catch (error) { if (error.code !== 'ENOENT') throw error }
-  home = location ?? join(homedir(), '.dsh')
-}
-home = resolve(home)
+const home = dataHome()
 const socketPath = join(homedir(), '.dsh-next-window-control', createHash('sha256').update(home).digest('hex').slice(0, 16), 'control.sock')
 const response = await new Promise((resolveResult, reject) => {
   let body = ''

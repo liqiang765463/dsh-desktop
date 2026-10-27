@@ -1,5 +1,7 @@
 # Codex task-bound native windows
 
+For portable Mac packaging, installation, rollback and interrupted transactions, see [PORTABLE-UPGRADE.md](PORTABLE-UPGRADE.md). The installed tools resolve the current user's paths and do not depend on the original developer checkout.
+
 `dsh-window bind` reads `CODEX_THREAD_ID` from the Codex execution environment and claims a persistent UUID. Every later tool call from that task goes directly to that window. The label, task suffix and UUID prefix appear in its native title. Closing/reopening or restarting DSH retains that identity and Chromium partition. Another task receives another unclaimed window or a new one; no focus-dependent fallback is allowed.
 
 The supported operator is a local CLI, not an app-wide Computer Use/MCP session:
