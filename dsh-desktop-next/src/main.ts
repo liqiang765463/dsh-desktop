@@ -412,7 +412,16 @@ async function reloadMain(owner = appWindows.active()): Promise<void> {
   const existing = owner
   if (!existing) openMain()
   // A newly created window already started its first navigation in openMain().
-  if (existing && appWindows.all.includes(existing) && !existing.isDestroyed()) await loadMainDocument(existing)
+  if (existing && appWindows.all.includes(existing) && !existing.isDestroyed()) {
+    await loadMainDocument(existing).catch(error => reportWindowFailure(existing, error))
+  }
+}
+
+/** Explicit shared-Host changes reconnect every renderer to the new transport. */
+async function reloadApplicationWindows(): Promise<void> {
+  const windows = appWindows.all
+  if (!windows.length) { openMain(); return }
+  await Promise.all(windows.map(window => reloadMain(window)))
 }
 
 /**
@@ -612,7 +621,7 @@ async function performCommand(input: Record<string, unknown>, type: string, sour
           ? t('开启后，同一网络中的设备可通过 HTTPS 访问。登录链接可授予访问权限，请仅与可信设备共享。正在运行的任务会被中断。', 'Devices on your network can connect over HTTPS. Login links grant access; share only with trusted devices. Running tasks will be interrupted.')
           : undefined)) return
         await runtime.restart(() => runtime.writePreferences(preferences))
-        if (mainWindow) await loadMainDocument(mainWindow)
+        await reloadApplicationWindows()
       } else {
         if (preferences.browserAccess && preferences.networkExposure === 'lan'
           && (!runtime.preferences.browserAccess || runtime.preferences.networkExposure !== 'lan')
@@ -671,7 +680,7 @@ async function performCommand(input: Record<string, unknown>, type: string, sour
       return
     }
     await runtime.restart(change)
-    await reloadMain()
+    await reloadApplicationWindows()
     if (!runtime.safeMode && mainWindow) shellWindow?.close()
   } catch (error) {
     if (type === 'recovery-action' || onboarding && (type === 'onboarding-complete' || type === 'onboarding-skip')) runtime.diagnostics.append(String(error), 'error')

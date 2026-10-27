@@ -1114,6 +1114,11 @@ it('opens isolated native windows on one running Host and reloads only the reque
     await command(sender(second), { type: 'reload' })
     expect(first.loadedUrls).toHaveLength(before)
     expect(second.loadedUrls).toHaveLength(2)
+    fixture.load.mockRejectedValueOnce(new Error('This renderer failed to reload'))
+    await command(sender(second), { type: 'reload' })
+    expect(first.loadedUrls).toHaveLength(before)
+    expect(fixture.report).not.toHaveBeenCalled()
+    expect(fixture.diagnosticAppend).toHaveBeenCalledWith(expect.objectContaining({ event: 'load.failed' }))
     expect(fixture.stop).not.toHaveBeenCalled()
     const { app } = await import('electron')
     const close = { preventDefault: vi.fn() }
@@ -1124,5 +1129,25 @@ it('opens isolated native windows on one running Host and reloads only the reque
     expect(fixture.handlers.get('dsh-next:state')!(sender(first))).toBeDefined()
     expect(fixture.close).not.toHaveBeenCalled()
     expect(() => fixture.handlers.get('dsh-next:state')!(sender(second))).toThrow('Rejected')
+  } finally { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
+})
+
+it('reconnects every window only after an explicitly confirmed shared Host restart', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'next-multiwindow-restart-'))
+  vi.stubEnv('DSH_DESKTOP_NEXT_HOME', home)
+  try {
+    await import('../src/main.ts')
+    await vi.waitFor(() => expect(fixture.windows).toHaveLength(1))
+    const command = fixture.handlers.get('dsh-next:command')!
+    const first = fixture.windows[0]
+    const sender = { sender: first.webContents, senderFrame: first.webContents.mainFrame }
+    await command(sender, { type: 'new-window' })
+    const second = fixture.windows[1]
+    expect(first.loadedUrls).toHaveLength(1)
+    expect(second.loadedUrls).toHaveLength(1)
+    await command(sender, { type: 'restart' })
+    expect(fixture.restart).toHaveBeenCalledOnce()
+    expect(first.loadedUrls).toHaveLength(2)
+    expect(second.loadedUrls).toHaveLength(2)
   } finally { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
 })
