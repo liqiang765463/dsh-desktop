@@ -1,5 +1,5 @@
 /** Fixed, bounded page operations. No caller-supplied JavaScript, OS input, clipboard or focus. */
-export function windowPage(request: Record<string, any>): unknown {
+export async function windowPage(request: Record<string, any>): Promise<unknown> {
   const global = globalThis as any
   if (location.protocol !== 'dsh-app:' || location.hostname !== 'app') throw new Error('UNSUPPORTED_SURFACE: only the owned DSH document can be controlled')
   const state = global.__DSH_WINDOW_DRIVER_V1 ??= { documentId: crypto.randomUUID(), elements: new Map(), observation: '' }
@@ -11,6 +11,13 @@ export function windowPage(request: Record<string, any>): unknown {
       && style.visibility !== 'hidden' && style.display !== 'none'
   }
   if (request.action === 'snapshot') {
+    if (!document.querySelector('button,input,[contenteditable="true"]')) await new Promise<void>(resolve => {
+      const observer = new MutationObserver(() => {
+        if (document.querySelector('button,input,[contenteditable="true"]')) { clearTimeout(timer); observer.disconnect(); resolve() }
+      })
+      const timer = setTimeout(() => { observer.disconnect(); resolve() }, 10_000)
+      observer.observe(document.documentElement, { childList: true, subtree: true })
+    })
     state.elements = new Map(); state.observation = request.observation
     const nodes = [...document.querySelectorAll('button,a,input,textarea,select,[contenteditable="true"],[role="button"],[role="tab"],[role="treeitem"],[role="row"],[role="combobox"],[role="option"],[role="menuitem"],summary')]
       .filter(visible).slice(0, 400).map((el, index) => {

@@ -7,7 +7,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
-const base = '6a63b9730b82cf4e858b9a11ac9783da9a5a0c3a'
+const baseFile = 'dsh-desktop-next/window-feature-base.json'
+const base = JSON.parse(readFileSync(join(repo, baseFile), 'utf8')).upstreamRevision
+if (!/^[0-9a-f]{40}$/u.test(base)) throw new Error('Invalid feature base revision')
 function run(command, args, cwd = repo, input) {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8', input, maxBuffer: 20 * 1024 * 1024 })
   if (result.error) throw result.error
@@ -19,14 +21,25 @@ function checked(command, args, cwd = repo, input) {
   return result.stdout.trim()
 }
 const [mode = 'export', ...args] = process.argv.slice(2)
-if (!['export', 'prepare'].includes(mode)) throw new Error('Usage: dsh-next-upgrade export OUT | prepare REF OUT')
+if (!['export', 'prepare', 'verify'].includes(mode)) throw new Error('Usage: dsh-next-upgrade export OUT | prepare REF OUT | verify OUT')
 let target = mode === 'prepare' ? args.shift() : undefined
 const out = resolve(args.shift() ?? join(repo, '../window-upgrade-' + Date.now()))
 if (args.length || !target && mode === 'prepare') throw new Error('An exact upstream ref and a new output directory are required')
+if (mode === 'verify') {
+  const previous = JSON.parse(readFileSync(join(out, 'upgrade.json'), 'utf8'))
+  const digest = createHash('sha256').update(readFileSync(join(out, 'windows.patch'))).digest('hex')
+  if (digest !== previous.patchSha256) throw new Error('Patch checksum changed')
+  if (checked('git', ['ls-files', '-u'], join(out, 'source'))) {
+    console.log(JSON.stringify({ directory: out, ...previous, state: 'needs_source_merge' })); process.exit(3)
+  }
+  verifyUpgrade(out, previous); process.exit(process.exitCode ?? 0)
+}
 if (existsSync(out)) throw new Error('Refusing an existing output directory')
 if (checked('git', ['status', '--porcelain', '--untracked-files=normal'])) throw new Error('Commit the feature changes first; upgrades must export an exact reviewed source revision')
 const feature = checked('git', ['rev-parse', 'HEAD'])
-const patch = run('git', ['diff', '--binary', base, feature, '--', 'dsh-desktop-next', '.agents/notes/implemented/desktop']).stdout
+const diff = run('git', ['diff', '--binary', base, feature, '--', 'dsh-desktop-next', '.agents/notes/implemented/desktop'])
+if (diff.status !== 0) throw new Error(diff.stderr)
+const patch = diff.stdout
 if (!patch.includes('window-identities.ts') || !patch.includes('window-control.ts') || !patch.includes('dsh-window.mjs')) throw new Error('Feature patch is incomplete')
 mkdirSync(out, { recursive: true, mode: 0o700 })
 writeFileSync(join(out, 'windows.patch'), patch)
@@ -54,6 +67,13 @@ if (merge.status !== 0) {
   console.log(JSON.stringify({ directory: out, ...manifest, explanation: 'Upstream changed the same source. Review conflicts in this isolated checkout; the current application is untouched.' }))
   process.exit(3)
 }
+verifyUpgrade(out, manifest)
+
+function verifyUpgrade(out, manifest) {
+const checkout = join(out, 'source')
+const save = () => writeFileSync(join(out, 'upgrade.json'), JSON.stringify(manifest, null, 2) + '\n')
+writeFileSync(join(checkout, baseFile), JSON.stringify({ version: 1, upstreamRef: manifest.target, upstreamRevision: manifest.targetRevision }, null, 2) + '\n')
+checked('git', ['add', baseFile], checkout)
 manifest.state = 'merged_requires_checks'; save()
 // Reuse dependencies only when upstream declared exactly the same versions. No hidden package updates.
 for (const file of ['package.json', 'yarn.lock', 'dsh-desktop-next/package.json']) {
@@ -69,7 +89,7 @@ for (const file of ['package.json', 'yarn.lock', 'dsh-desktop-next/package.json'
   }
 }
 for (const relative of ['node_modules', 'dsh-desktop-next/node_modules']) {
-  if (existsSync(join(repo, relative))) symlinkSync(join(repo, relative), join(checkout, relative), 'dir')
+  if (!existsSync(join(checkout, relative)) && existsSync(join(repo, relative))) symlinkSync(join(repo, relative), join(checkout, relative), 'dir')
 }
 const test = run(process.execPath, [join(repo, 'node_modules/vitest/vitest.mjs'), 'run', '--config', 'vitest.config.ts',
   'tests/window-identities.spec.ts', 'tests/window-control.spec.ts', 'tests/app-windows.spec.ts', 'tests/main-lifecycle.spec.ts',
@@ -81,3 +101,5 @@ writeFileSync(join(out, 'build.log'), build.stdout + build.stderr)
 manifest.state = build.status === 0 ? 'source_checks_passed_native_install_pending' : 'build_failed'; save()
 console.log(JSON.stringify({ directory: out, ...manifest }))
 process.exitCode = build.status === 0 ? 0 : 6
+
+}
