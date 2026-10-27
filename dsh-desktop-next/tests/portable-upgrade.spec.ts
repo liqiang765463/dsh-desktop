@@ -28,6 +28,9 @@ describe('portable Mac upgrade transactions', () => {
       expect(dataHome({ userHome: f.root, env: {} })).toBe(f.home)
       expect(findApp({ candidates: [f.app], env: {} })).toBe(f.app)
       expect(() => findApp({ candidates: [f.app, join(f.bundle, 'DSH NEXT.app')], env: {} })).toThrow('Multiple')
+      const saved = join(f.root, '.local/share/dsh-next-upgrade')
+      mkdirSync(saved, { recursive: true }); writeFileSync(join(saved, 'installation.json'), JSON.stringify({ app: f.app }))
+      expect(findApp({ userHome: f.root, env: {} })).toBe(f.app)
       writeFileSync(join(anchor, 'desktop-next-location.json'), '{"home":"relative"}')
       expect(() => dataHome({ userHome: f.root, env: {} })).toThrow('refusing to guess')
     } finally { f.close() }

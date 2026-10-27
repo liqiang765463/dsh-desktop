@@ -18,6 +18,12 @@ export function findApp({ app, userHome = homedir(), env = process.env, candidat
     if (!existsSync(join(selected, 'Contents/Resources/app.asar'))) throw new Error('DSH NEXT app.asar not found at the specified application')
     return selected
   }
+  const installed = join(userHome, '.local/share/dsh-next-upgrade/installation.json')
+  if (!candidates && existsSync(installed)) {
+    const saved = JSON.parse(readFileSync(installed, 'utf8'))
+    if (typeof saved.app !== 'string' || !isAbsolute(saved.app) || !existsSync(join(saved.app, 'Contents/Resources/app.asar'))) throw new Error('Previously selected DSH NEXT app is unavailable; specify --app')
+    return resolve(saved.app)
+  }
   const found = (candidates ?? [join(userHome, 'Applications/DSH NEXT.app'), '/Applications/DSH NEXT.app'])
     .filter(p => existsSync(join(p, 'Contents/Resources/app.asar')))
   if (found.length !== 1) throw new Error(found.length ? 'Multiple DSH NEXT apps found; specify --app' : 'DSH NEXT not found; specify --app')

@@ -8,6 +8,10 @@ import { fileURLToPath } from 'node:url'
 import { dataHome, findApp } from './window-locations.mjs'
 import { member, overlay } from './portable-asar.mjs'
 
+// Electron's RunAsNode still virtualizes app.asar as a directory by default.
+// The installer needs real file hashes, not that virtual filesystem.
+if (process.versions.electron) process.noAsar = true
+
 const scripts = dirname(fileURLToPath(import.meta.url))
 export function sha(file) {
   const fd = openSync(file, 'r'), hash = createHash('sha256'), buffer = Buffer.alloc(1024 * 1024)
@@ -100,6 +104,7 @@ function layout(options = {}) {
   const key = createHash('sha256').update(app).digest('hex').slice(0, 16)
   const state = resolve(options.state ?? join(homedir(), 'Library/Application Support/DSH NEXT Upgrades', key))
   regularApp(app)
+  if (!options.validate) appInfo(app)
   if (within(app, home) || within(home, app) || within(state, app) || within(state, home)) throw new Error('Application, upgrade state and DSH data must be separate directories')
   return { app, home, state, validate: options.validate ?? validateApp, running: options.running ?? runningApp, copy: options.copy ?? copyApp, fault: options.fault ?? (() => {}) }
 }
