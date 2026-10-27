@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlin
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { dataHome, findApp } from '../scripts/window-locations.mjs'
-import { installPackage, rollback, recover, tree, manifestPackage } from '../scripts/portable-upgrade.mjs'
+import { installPackage, rollback, recover, tree, manifestPackage, assertUpgradeVersion } from '../scripts/portable-upgrade.mjs'
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'dsh-upgrade-'))
@@ -20,6 +20,12 @@ function fixture() {
   return { root, app, bundle, home, options, close: () => rmSync(root, { recursive: true, force: true }) }
 }
 describe('portable Mac upgrade transactions', () => {
+  it('accepts same-version repairs and forward updates but refuses accidental downgrades', () => {
+    expect(() => assertUpgradeVersion('2.0.19-next', '2.0.19-next')).not.toThrow()
+    expect(() => assertUpgradeVersion('2.0.19-next', '2.0.20-next')).not.toThrow()
+    expect(() => assertUpgradeVersion('2.0.20-next', '2.0.19-next')).toThrow('DOWNGRADE_REFUSED')
+    expect(() => assertUpgradeVersion('2.9.99-next', '3.0.0-next')).not.toThrow()
+  })
   it('discovers a custom data location and refuses ambiguous applications', () => {
     const f = fixture()
     try {

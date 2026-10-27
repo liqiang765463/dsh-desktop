@@ -66,6 +66,14 @@ export function runningApp(app) {
   })
 }
 function closed(app, running) { if (running(app).length) throw new Error('DSH_RUNNING: close this DSH NEXT normally, then rerun; no process was terminated') }
+export function assertUpgradeVersion(current, candidate) {
+  const parse = value => { const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/u.exec(value); if (!match) throw new Error('Unrecognized application version'); return match.slice(1).map(Number) }
+  const old = parse(current), next = parse(candidate)
+  for (let i = 0; i < 3; i++) {
+    if (next[i] < old[i]) throw new Error('DOWNGRADE_REFUSED: this package is older than the installed app; use a verified rollback receipt instead')
+    if (next[i] > old[i]) return
+  }
+}
 function copyApp(source, destination) {
   if (existsSync(destination)) throw new Error('Copy destination already exists')
   if (process.platform === 'darwin') command('cp', ['-cR', source, destination])
@@ -141,7 +149,11 @@ export function recover(receipt, options = {}) {
 }
 export function installPackage(bundle, options = {}) {
   bundle = resolve(bundle)
-  const m = verifyPackage(bundle), x = layout(options); x.validate(join(bundle, 'DSH NEXT.app')); closed(x.app, x.running)
+  const m = verifyPackage(bundle), x = layout(options), supplied = x.validate(join(bundle, 'DSH NEXT.app')); closed(x.app, x.running)
+  if (!options.validate) {
+    if (supplied.version !== m.version) throw new Error('Package version differs from the actual application')
+    assertUpgradeVersion(appInfo(x.app).version, supplied.version)
+  }
   return lock(x.state, () => {
     const before = protectedState(x.home), id = Date.now() + '-' + randomUUID(), parent = dirname(x.app)
     const stage = join(parent, '.DSH-NEXT-stage-' + id + '.app'), backup = join(parent, '.DSH-NEXT-backup-' + id + '.app')
