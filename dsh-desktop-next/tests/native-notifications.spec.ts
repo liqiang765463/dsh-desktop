@@ -3,8 +3,9 @@ import { DEFAULT_PREFERENCES, type DesktopBridge, type DesktopState } from '../s
 import { NextSettingsAdapter } from '../src/client/settings-adapter.ts'
 import { NativeDesktop } from '../src/native-desktop.ts'
 
-const { show } = vi.hoisted(() => ({ show: vi.fn() }))
+const { show, setMenu } = vi.hoisted(() => ({ show: vi.fn(), setMenu: vi.fn() }))
 vi.mock('electron', () => ({
+  Menu: { buildFromTemplate: (items: unknown) => items, setApplicationMenu: setMenu },
   Notification: class {
     static isSupported(): boolean { return true }
     once(): void {}
@@ -12,6 +13,25 @@ vi.mock('electron', () => ({
     close(): void {}
   },
 }))
+
+it('retains the new-window action through menu refreshes and language changes', () => {
+  const run = vi.fn()
+  let language = 'zh-CN'
+  const native = new NativeDesktop({
+    root: '/fixture', language: () => language,
+    state: () => ({ preferences: { ...DEFAULT_PREFERENCES }, phase: 'ready', features: {}, profiles: ['desktop'], unavailableProfiles: [] }) as unknown as DesktopState,
+    window: () => undefined, show() {}, run, warn() {},
+  })
+  for (const locale of ['zh-CN', 'en', 'zh-CN']) {
+    language = locale
+    native.refresh()
+    const action = setMenu.mock.lastCall![0].find((item: any) => item.role === 'windowMenu').submenu[0]
+    expect(action.label).toBe(locale === 'en' ? 'New Independent Window' : '新建独立窗口')
+    expect(action.accelerator).toBe('CmdOrCtrl+Shift+N')
+    action.click()
+  }
+  expect(run.mock.calls).toEqual([[{ type: 'new-window' }], [{ type: 'new-window' }], [{ type: 'new-window' }]])
+})
 
 it('uses notification switches saved by the settings form on every native delivery', async () => {
   const state = {

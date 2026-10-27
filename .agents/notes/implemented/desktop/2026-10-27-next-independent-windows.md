@@ -1,0 +1,7 @@
+# Next independent application windows
+
+The owner asked to operate separate desktop windows while an existing AI task keeps its current page and conversation. One shared Host is retained. Membership-based native IPC replaces primary-window-only checks, and each additional application renderer gets its own persistent Chromium partition. This isolates page selection, plugin local UI state and unsent drafts without copying credentials or business data. Keyboard recording, reload and directory picking are per-window; a closed or failed renderer cannot stop the remaining windows.
+
+The first window retains its existing default session. Shared Profile/plugin/business changes remain shared operations. Verification covers registered/foreign/retired senders, isolated session assignment, requesting-window reload, close behavior and the existing native authentication/permission paths. The active user application is not restarted for installation.
+
+Native macOS smoke testing also caught the tray/update locale refresh replacing the initial application menu. The new-window action now belongs to NativeDesktop.refresh itself, with a repeated-refresh regression test. The 102-test focused suite, bundle build, registry typecheck and native two-session/draft/navigation/reload/close checks pass; a full package typecheck remains unavailable with the reused installed dependencies' incomplete development declarations.

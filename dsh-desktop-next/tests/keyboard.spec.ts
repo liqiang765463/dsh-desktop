@@ -24,6 +24,7 @@ it('authorizes the product frame, routes native bindings, persists edits and rel
     () => ({ revision: Number(blocked), blocked }))
   const handler = (channel: string) => ipc.handle.mock.calls.find(call => call[0] === channel)![1]
   const event = { sender: contents, senderFrame: mainFrame }
+  keyboard.attach(window as never)
   try {
     const definitions = [{ id: 'sidebar.left.toggle', defaults: { 'desktop:macos': { code: 'KeyB', modifiers: ['primary'] } } }]
     await expect(handler(IPC.shortcutsGet)({ ...event, sender: {} }, definitions)).rejects.toThrow('rejected sender')
@@ -32,7 +33,6 @@ it('authorizes the product frame, routes native bindings, persists edits and rel
     await expect(handler(IPC.shortcutsGet)(event, definitions)).rejects.toThrow('rejected origin')
     mainFrame.url = 'dsh-app://app/'
     const snapshot = await handler(IPC.shortcutsGet)(event, definitions)
-    keyboard.attach(window as never)
     const input = { type: 'keyDown', key: 'b', code: 'KeyB', control: false, alt: false, shift: false, meta: true, isAutoRepeat: false, isComposing: false, modifiers: ['meta'] }
     const prevented = { defaultPrevented: false, preventDefault: vi.fn() }
     contents.emit('before-input-event', prevented, input)
@@ -56,4 +56,34 @@ it('authorizes the product frame, routes native bindings, persists edits and rel
     expect(ipc.removeHandler).toHaveBeenCalledWith(IPC.shortcutsGet)
     await rm(home, { recursive: true, force: true })
   }
+})
+
+it('keeps another window usable while recording or closing keys in the first window', async () => {
+  ipc.handle.mockClear()
+  const home = await mkdtemp(join(tmpdir(), 'next-two-window-keys-'))
+  const make = () => {
+    const mainFrame = { url: 'dsh-app://app/', parent: null, name: '' }
+    const webContents = Object.assign(new EventEmitter(), { mainFrame, focusedFrame: mainFrame, isDestroyed: () => false, isFocused: () => true,
+      send: vi.fn(), setIgnoreMenuShortcuts: vi.fn(), focus: vi.fn(), sendInputEvent: vi.fn() })
+    return Object.assign(new EventEmitter(), { webContents, isDestroyed: () => false, isFocused: () => true, isEnabled: () => true, close: vi.fn() })
+  }
+  const first = make(), second = make()
+  let active = first
+  const keyboard = installDesktopShortcuts(() => active as never, home, 'macos', vi.fn(), () => ({ revision: 0, blocked: false }))
+  keyboard.attach(first as never); keyboard.attach(second as never)
+  const handler = (name: string) => ipc.handle.mock.calls.find(call => call[0] === name)![1]
+  const sender = (window: typeof first) => ({ sender: window.webContents, senderFrame: window.webContents.mainFrame })
+  try {
+    const definitions = [{ id: 'sidebar.left.toggle', defaults: { 'desktop:macos': { code: 'KeyB', modifiers: ['primary'] } } }]
+    await handler(IPC.shortcutsGet)(sender(first), definitions)
+    handler(IPC.shortcutsRecording)(sender(first), true)
+    active = second
+    const key = { type: 'keyDown', key: 'b', code: 'KeyB', control: false, alt: false, shift: false, meta: true, isAutoRepeat: false, isComposing: false, modifiers: ['meta'] }
+    second.webContents.emit('before-input-event', { defaultPrevented: false, preventDefault: vi.fn() }, key)
+    expect(second.webContents.send).toHaveBeenCalledWith(IPC.shortcutsInput, expect.objectContaining({ code: 'KeyB' }))
+    first.emit('closed')
+    second.webContents.send.mockClear()
+    second.webContents.emit('before-input-event', { defaultPrevented: false, preventDefault: vi.fn() }, key)
+    expect(second.webContents.send).toHaveBeenCalledWith(IPC.shortcutsInput, expect.objectContaining({ code: 'KeyB' }))
+  } finally { keyboard.dispose(); await rm(home, { recursive: true, force: true }) }
 })

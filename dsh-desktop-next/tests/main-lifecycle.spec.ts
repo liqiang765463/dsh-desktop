@@ -73,7 +73,7 @@ vi.mock('electron', async () => {
     webContents = Object.assign(new EventEmitter(), { id: fixture.windows.length + 1,
       mainFrame: { url: '' }, getURL: () => this.webContents.mainFrame.url, setWindowOpenHandler() {}, send: vi.fn(), isDestroyed: () => false,
       setIgnoreMenuShortcuts() {}, isFocused: () => true, executeJavaScript: vi.fn(async () => true) })
-    constructor(readonly options: any) { super(); fixture.windows.push(this) }
+    constructor(readonly options: any) { super(); Object.assign(this.webContents, { session: options.webPreferences.session }); fixture.windows.push(this) }
     destroyed = false
     isDestroyed() { return this.destroyed }
     isMinimized() { return false }
@@ -81,6 +81,7 @@ vi.mock('electron', async () => {
     show() { this.visible = true }
     hide() { this.visible = false }
     focus() {}
+    setTitle = vi.fn()
     setSize() {}
     setResizable() {}
     setMinimumSize() {}
@@ -110,7 +111,7 @@ vi.mock('electron', async () => {
     // Templates stay plain arrays for tray assertions; the popup spy is non-enumerable.
     Menu: { buildFromTemplate: (items: any) => Object.defineProperty(items, 'popup', { value: (options: unknown) => fixture.popup(items, options), configurable: true }), setApplicationMenu() {} },
     protocol: { registerSchemesAsPrivileged() {}, handle() {} },
-    session: { defaultSession: { webRequest: { onBeforeSendHeaders() {} }, setPermissionCheckHandler() {}, setPermissionRequestHandler() {}, setDisplayMediaRequestHandler() {}, on() {} } },
+    session: { fromPartition: (partition: string) => ({ partition, protocol: { handle() {} }, webRequest: { onBeforeSendHeaders() {} }, setPermissionCheckHandler() {}, setPermissionRequestHandler() {}, setDisplayMediaRequestHandler() {}, on() {} }), defaultSession: { protocol: { handle() {} }, webRequest: { onBeforeSendHeaders() {} }, setPermissionCheckHandler() {}, setPermissionRequestHandler() {}, setDisplayMediaRequestHandler() {}, on() {} } },
     systemPreferences: { getMediaAccessStatus: () => 'not-determined', askForMediaAccess: vi.fn(async () => false), isTrustedAccessibilityClient: () => false },
     desktopCapturer: { getSources: vi.fn(async () => []) },
     ipcMain: { removeHandler: (name: string) => fixture.handlers.delete(name), handle: (name: string, action: (...args: any[]) => any) => fixture.handlers.set(name, action), on: (name: string, action: (...args: any[]) => any) => fixture.handlers.set(name, action) },
@@ -890,7 +891,7 @@ it.each(['cancelled', 'retired', 'failed'] as const)('handles %s main-window nav
     rejectLoad(error)
     // Flush the loadURL and navigation-handler promise chain.
     await new Promise(resolve => setImmediate(resolve))
-    if (kind === 'failed') expect(fixture.report).toHaveBeenCalledWith(error)
+    if (kind === 'failed') expect(fixture.diagnosticAppend).toHaveBeenCalledWith(expect.objectContaining({ source: 'electron.window', error }))
     else expect(fixture.report).not.toHaveBeenCalled()
     if (kind === 'retired') {
       main.webContents.emit('did-fail-load', {}, -2, 'retired navigation', 'dsh-app://app/', true)
@@ -1092,4 +1093,36 @@ it('disables and re-enables a Profile bundle from recovery without running the p
     expect(JSON.parse(readFileSync(path, 'utf8')).dsh.profile.bundles).toContain('my-plugin')
     expect(fixture.plugin).not.toHaveBeenCalled()
   } finally { process.argv.splice(0, process.argv.length, ...argv); vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
+})
+
+
+it('opens isolated native windows on one running Host and reloads only the requesting window', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'next-multiwindow-'))
+  vi.stubEnv('DSH_DESKTOP_NEXT_HOME', home)
+  try {
+    await import('../src/main.ts')
+    await vi.waitFor(() => expect(fixture.windows).toHaveLength(1))
+    const first = fixture.windows[0]
+    const command = fixture.handlers.get('dsh-next:command')!
+    const sender = (window: any) => ({ sender: window.webContents, senderFrame: window.webContents.mainFrame })
+    await command(sender(first), { type: 'new-window' })
+    expect(fixture.windows).toHaveLength(2)
+    const second = fixture.windows[1]
+    expect(second.options.webPreferences.session).not.toBe(first.options.webPreferences.session)
+    expect(second.options.webPreferences.session.partition).toBe('persist:dsh-next-window-1')
+    const before = first.loadedUrls.length
+    await command(sender(second), { type: 'reload' })
+    expect(first.loadedUrls).toHaveLength(before)
+    expect(second.loadedUrls).toHaveLength(2)
+    expect(fixture.stop).not.toHaveBeenCalled()
+    const { app } = await import('electron')
+    const close = { preventDefault: vi.fn() }
+    second.emit('close', close)
+    expect(close.preventDefault).not.toHaveBeenCalled()
+    expect(app.quit).not.toHaveBeenCalled()
+    second.destroy()
+    expect(fixture.handlers.get('dsh-next:state')!(sender(first))).toBeDefined()
+    expect(fixture.close).not.toHaveBeenCalled()
+    expect(() => fixture.handlers.get('dsh-next:state')!(sender(second))).toThrow('Rejected')
+  } finally { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
 })

@@ -1,3 +1,4 @@
+import { ApplicationWindows } from './app-windows.ts'
 /** Official Desktop transport with a Host-independent native shell. */
 import { installDesktopShortcuts } from './keyboard.ts'
 import { spawn } from 'node:child_process'
@@ -83,6 +84,8 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'dsh-app', privileges: {
   standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true,
 } }])
 
+const appWindows = new ApplicationWindows<BrowserWindow>()
+const configuredAppSessions = new WeakSet<Electron.Session>()
 let mainWindow: BrowserWindow | undefined
 // Storage partitions outlive individual windows, so the guest owner is process-scoped.
 let desktopShortcuts: ReturnType<typeof installDesktopShortcuts> | undefined
@@ -94,7 +97,7 @@ let diagnosticsFile: string | undefined
 let recoveryNotice: NonNullable<DesktopState['recovery']>['notice']
 let recoveryStopping: Promise<void> | undefined
 let recoveryRequest: Promise<void> | undefined
-let pendingSettings: DesktopSettingsPage | undefined
+const pendingSettings = new WeakMap<BrowserWindow, DesktopSettingsPage>()
 let quitting = false
 let onboarding = false
 let onboardingSurfaceActive = false
@@ -211,7 +214,7 @@ function assertSender(event: Pick<IpcMainInvokeEvent, 'sender' | 'senderFrame'>,
     || event.senderFrame !== owner.webContents.mainFrame || !event.senderFrame.url.startsWith(origin)) throw new Error('Rejected Next IPC sender')
 }
 function assertDesktopSender(event: Pick<IpcMainInvokeEvent, 'sender' | 'senderFrame'>): void {
-  if (event.sender === mainWindow?.webContents) assertSender(event, mainWindow, APP_URL)
+  if (appWindows.fromContents(event.sender.id)) appWindows.owner(event)
   else assertSender(event, shellWindow, 'dsh-app://shell/')
 }
 /**
@@ -240,7 +243,9 @@ function show(window: BrowserWindow): void {
  */
 const WINDOWS_CAPTION_FILL = '#00000000'
 
-function createWindow(preload: string, primary = false): BrowserWindow {
+function createWindow(preload: string, primary = false, slot = 0): BrowserWindow {
+  const appSession = primary && slot > 0 ? session.fromPartition(`persist:dsh-next-window-${slot}`) : session.defaultSession
+  if (primary) configureAppSession(appSession)
   const window = new BrowserWindow({ width: 1280, height: 840, minWidth: 800, minHeight: 580,
     show: false, title: 'DSH NEXT',
     ...(process.platform !== 'darwin' ? { icon: unpackedPath(join(root, 'build', process.platform === 'win32' ? 'app-icon.ico' : 'app-icon.png')) } : {}),
@@ -257,7 +262,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
     } : {}),
     // `webviewTag` only on the application document: every attachment is still refused unless
     // `DesktopBrowserGuests` issued the lease, and the guest itself never gets the tag.
-    webPreferences: { preload: join(root, 'lib', preload), contextIsolation: true, sandbox: true, nodeIntegration: false, webviewTag: primary },
+    webPreferences: { ...(primary ? { session: appSession } : {}), preload: join(root, 'lib', preload), contextIsolation: true, sandbox: true, nodeIntegration: false, webviewTag: primary },
   })
   let intervalStart = Date.now()
   let count = 0
@@ -285,9 +290,10 @@ function createWindow(preload: string, primary = false): BrowserWindow {
   if (primary) {
     applyWindowMaterial(window, runtime.preferences)
     window.webContents.on('before-input-event', (event, input) => {
-      if (input.type === 'keyDown' && input.key === ',' && (input.control || input.meta) && !input.alt) { event.preventDefault(); openControls() }
+      if (input.type === 'keyDown' && input.key === ',' && (input.control || input.meta) && !input.alt) { event.preventDefault(); openSettings('general', window) }
     })
     window.on('close', event => {
+      if (!quitting && appWindows.all.length > 1) return
       if (!quitting && runtime.preferences.closeToTray && native.available) { event.preventDefault(); window.hide() }
       else if (!quitting) { event.preventDefault(); app.quit() }
     })
@@ -310,25 +316,27 @@ function createWindow(preload: string, primary = false): BrowserWindow {
   return window
 }
 
-function openSettings(page: DesktopSettingsPage = 'general'): void {
+function openSettings(page: DesktopSettingsPage = 'general', owner = appWindows.active()): void {
   if (quitting) return
   if (runtime.recoveryMode || runtime.state().phase === 'error') { openControls('recovery'); return }
-  pendingSettings = page
-  openMain()
-  mainWindow?.webContents.send(IPC.settingsOpen)
+  if (!owner) { openMain(); owner = appWindows.active() }
+  if (!owner) return
+  pendingSettings.set(owner, page)
+  show(owner)
+  owner.webContents.send(IPC.settingsOpen)
 }
 
-function openControls(page: 'general' | 'profiles' | 'create-profile' | 'tools' | 'recovery' | 'permissions' = 'general'): void {
+function openControls(page: 'general' | 'profiles' | 'create-profile' | 'tools' | 'recovery' | 'permissions' = 'general', owner = appWindows.active()): void {
   if (quitting) return
-  if (page === 'general' || page === 'tools' || page === 'permissions') { openSettings(page === 'permissions' ? 'permissions' : 'general'); return }
+  if (page === 'general' || page === 'tools' || page === 'permissions') { openSettings(page === 'permissions' ? 'permissions' : 'general', owner); return }
   if (page === 'recovery' && !runtime.safeMode && !runtime.recoveryMode) {
     runtime.recoveryMode = true
     onboarding = false
     // Destroy bypasses the normal close-to-tray/app-quit handler.
-    const previousMain = mainWindow
+    const previousWindows = appWindows.all
     mainWindow = undefined
     replacingWindow = true
-    try { previousMain?.destroy() } finally { replacingWindow = false }
+    try { for (const window of previousWindows) window.destroy() } finally { replacingWindow = false }
     const stopping = runtime.backend.stop().finally(() => {
       if (recoveryStopping === stopping) recoveryStopping = undefined
     })
@@ -358,36 +366,53 @@ function openControls(page: 'general' | 'profiles' | 'create-profile' | 'tools' 
 function openMain(): void {
   if (quitting) return
   if (runtime.recoveryMode || runtime.state().phase === 'error') { openControls('recovery'); return }
-  if (mainWindow && !mainWindow.isDestroyed()) { show(mainWindow); return }
-  mainWindow = createWindow('preload-app.cjs', true)
-  const owner = mainWindow
+  const existing = appWindows.active()
+  if (existing) { show(existing); return }
+  openApplicationWindow()
+}
+
+function openApplicationWindow(): void {
+  if (quitting || runtime.recoveryMode || (runtime.busy && appWindows.all.length > 0) || (onboarding && appWindows.all.length > 0)) return
+  const slot = appWindows.nextSlot()
+  const owner = createWindow('preload-app.cjs', true, slot)
+  appWindows.add(owner, slot)
+  owner.webContents.on('page-title-updated', (event, title) => { event.preventDefault(); owner.setTitle(`${title} · ${t('窗口', 'Window')} ${slot + 1}`) })
+  mainWindow ??= owner
   // The guest owner installs its own navigation, crash and destruction release paths.
   browserGuests.bind(owner, (guest, name) => desktopShortcuts!.attachGuest(owner, guest, name))
   desktopShortcuts!.attach(owner)
-  mainWindow.on('closed', () => { mainWindow = undefined; onboardingSurfaceActive = false })
-  mainWindow.webContents.on('render-process-gone', (_event, details) => { if (!quitting) runtime.report(new Error(`Renderer: ${details.reason}`)) })
-  mainWindow.webContents.on('preload-error', (_event, _path, error) => runtime.report(error))
-  mainWindow.webContents.on('did-fail-load', (_event, code, message, _url, isMain) => {
-    if (isMain && code !== -3 && !quitting && mainWindow === owner && !owner.isDestroyed()) runtime.report(new Error(message))
+  owner.on('closed', () => { appWindows.delete(owner); if (mainWindow === owner) mainWindow = appWindows.all[0]; if (!mainWindow) onboardingSurfaceActive = false })
+  owner.webContents.on('render-process-gone', (_event, details) => { if (!quitting) reportWindowFailure(owner, new Error(`Renderer: ${details.reason}`)) })
+  owner.webContents.on('preload-error', (_event, _path, error) => reportWindowFailure(owner, error))
+  owner.webContents.on('did-fail-load', (_event, code, message, _url, isMain) => {
+    if (isMain && code !== -3 && !quitting && appWindows.all.includes(owner) && !owner.isDestroyed()) reportWindowFailure(owner, new Error(message))
   })
-  void loadMainDocument(owner).catch(error => runtime.report(error))
+  void loadMainDocument(owner).catch(error => reportWindowFailure(owner, error))
 }
+/** Renderer failures belong to their window; they do not stop the shared Host or other renderers. */
+function reportWindowFailure(owner: BrowserWindow, error: unknown): void {
+  runtime.diagnostics.record({ source: 'electron.window', event: 'load.failed', level: 'error', error, fields: { webContentsId: owner.webContents.id } })
+  if (quitting || owner.isDestroyed()) return
+  void dialog.showMessageBox(owner, { type: 'error', title: 'DSH NEXT', message: t('当前窗口加载失败', 'This window could not load'),
+    detail: t('其他窗口和后台任务保持运行。可在此窗口重新加载界面。', 'Other windows and background tasks keep running. Reload this window to retry.') }).catch(error => runtime.diagnostics.append(String(error), 'warn'))
+}
+
 /** Cancelled or retired window navigations are not Host failures. */
 async function loadMainDocument(owner: BrowserWindow): Promise<void> {
   try { await owner.loadURL(APP_URL) } catch (error) {
-    if (quitting || owner.isDestroyed() || mainWindow !== owner) return
+    if (quitting || owner.isDestroyed() || !appWindows.all.includes(owner)) return
     const failure = error as { code?: string; errno?: number }
     if (failure?.code === 'ERR_ABORTED' || failure?.errno === -3) return
     throw error
   }
 }
 
-async function reloadMain(): Promise<void> {
+async function reloadMain(owner = appWindows.active()): Promise<void> {
   onboardingSurfaceActive = false
-  const existing = mainWindow
-  openMain()
+  const existing = owner
+  if (!existing) openMain()
   // A newly created window already started its first navigation in openMain().
-  if (existing && existing === mainWindow && !existing.isDestroyed()) await loadMainDocument(existing)
+  if (existing && appWindows.all.includes(existing) && !existing.isDestroyed()) await loadMainDocument(existing)
 }
 
 /**
@@ -411,7 +436,7 @@ async function reloadMain(): Promise<void> {
  *   unowned dialog is the only thing left.
  */
 function raiseDialogOwner(): BrowserWindow | undefined {
-  for (const window of [shellWindow, mainWindow]) {
+  for (const window of [shellWindow, appWindows.active()]) {
     if (window === undefined || window.isDestroyed()) continue
     show(window)
     return window
@@ -445,7 +470,7 @@ async function promptAvailableUpdate(): Promise<void> {
 }
 async function openPath(path: string): Promise<void> { const error = await shell.openPath(path); if (error) throw new Error(error) }
 
-async function command(value: unknown, source: 'app' | 'shell' | 'native' = 'app'): Promise<void> {
+async function command(value: unknown, source: 'app' | 'shell' | 'native' = 'app', owner = appWindows.active()): Promise<void> {
   if (!value || typeof value !== 'object' || !('type' in value)) throw new Error('Invalid Next command')
   const input = value as Record<string, unknown>
   const type = input.type
@@ -454,24 +479,25 @@ async function command(value: unknown, source: 'app' | 'shell' | 'native' = 'app
   // release it after success, cancellation or failure so recovery can retry.
   if (['safe-mode', 'normal-mode', 'recover', 'restart', 'rollback', 'repair-global', 'restart-app', 'restart-recovery'].includes(type)) {
     if (recoveryRequest !== undefined) return recoveryRequest
-    const request = loggedCommand(input, type, source).finally(() => {
+    const request = loggedCommand(input, type, source, owner).finally(() => {
       if (recoveryRequest === request) recoveryRequest = undefined
     })
     recoveryRequest = request
     return request
   }
-  return loggedCommand(input, type, source)
+  return loggedCommand(input, type, source, owner)
 }
 
-async function loggedCommand(input: Record<string, unknown>, type: string, source: 'app' | 'shell' | 'native'): Promise<void> {
+async function loggedCommand(input: Record<string, unknown>, type: string, source: 'app' | 'shell' | 'native', owner?: BrowserWindow): Promise<void> {
   const end = runtime.diagnostics.operation('electron.commands', type, { caller: source }, true)
-  try { await performCommand(input, type, source); end() } catch (error) { end(error); throw error }
+  try { await performCommand(input, type, source, owner); end() } catch (error) { end(error); throw error }
 }
 
-async function performCommand(input: Record<string, unknown>, type: string, source: 'app' | 'shell' | 'native'): Promise<void> {
+async function performCommand(input: Record<string, unknown>, type: string, source: 'app' | 'shell' | 'native', owner?: BrowserWindow): Promise<void> {
+  if (type === 'new-window') { openApplicationWindow(); return }
   if (type === 'controls') {
     if (input.page !== undefined && (typeof input.page !== 'string' || !['general', 'profiles', 'create-profile', 'tools', 'recovery', 'permissions'].includes(input.page))) throw new Error('Invalid controls page')
-    openControls(input.page as Parameters<typeof openControls>[0]); return
+    openControls(input.page as Parameters<typeof openControls>[0], owner); return
   }
   if (type === 'close-controls') { shellWindow?.close(); return }
   if (type === 'quit') { app.quit(); return }
@@ -536,9 +562,9 @@ async function performCommand(input: Record<string, unknown>, type: string, sour
     }
     if (type === 'reload') {
       if (runtime.recoveryMode) { openMain(); return }
-      await reloadMain(); return
+      await reloadMain(owner); return
     }
-    if (type === 'devtools') { openMain(); (runtime.recoveryMode ? shellWindow : mainWindow)!.webContents.toggleDevTools(); return }
+    if (type === 'devtools') { (runtime.recoveryMode ? shellWindow : owner)?.webContents.toggleDevTools(); return }
     if (type === 'recovery-action') {
       await recoveryAction(input)
       return
@@ -594,7 +620,7 @@ async function performCommand(input: Record<string, unknown>, type: string, sour
             t('同一网络中的设备可以连接。请仅向可信设备分享登录链接，并在设备上核对和信任 CA 证书。', 'Devices on your local network can connect. Share login links only with trusted devices, and verify and trust the CA certificate on each device.'))) return
         await runtime.applyPreferences(preferences)
       }
-      if (mainWindow) applyWindowMaterial(mainWindow, preferences)
+      for (const window of appWindows.all) applyWindowMaterial(window, preferences)
       return
     }
     if (!['switch', 'features', 'restart', 'recover', 'safe-mode', 'normal-mode', 'rollback', 'repair-global'].includes(String(type))) throw new Error('Invalid Next command')
@@ -784,12 +810,58 @@ async function recoveryAction(input: Record<string, unknown>): Promise<void> {
   throw new Error('Unknown recovery action')
 }
 
+/** Configure each window's storage partition without sharing renderer navigation or drafts. */
+function configureAppSession(ownedSession: Electron.Session): void {
+  if (configuredAppSessions.has(ownedSession)) return
+  configuredAppSessions.add(ownedSession)
+  ownedSession.protocol.handle('dsh-app', async request => {
+    const url = new URL(request.url)
+    if (url.hostname === 'shell') {
+      const response = await serveWebDocument(request, join(root, 'lib/native-ui'), false)
+      response.headers.set('content-security-policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-src 'none'; base-uri 'none'")
+      return response
+    }
+    if (url.hostname !== 'app') return new Response(null, { status: 404 })
+    if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname.startsWith('/assets/')
+      || ['/favicon.svg', '/manifest.webmanifest'].includes(url.pathname)) return serveWebDocument(request, webRoot)
+    const auth = runtime.auth
+    if (!runtime.backend.host || !auth) return new Response(null, { status: 503 })
+    return forwardWebRequest(request, auth.url, auth.cookie, auth.token)
+  })
+  installMediaPermissions(ownedSession, {
+    window: () => appWindows.all.find(window => window.webContents.session === ownedSession), language: () => windowsLanguage, warn: error => runtime.diagnostics.append(String(error), 'warn'),
+  })
+  installAppDownloads(ownedSession, {
+    window: () => appWindows.all.find(window => window.webContents.session === ownedSession), language: () => windowsLanguage, downloads: () => app.getPath('downloads'),
+    warn: error => runtime.diagnostics.append(String(error), 'warn'),
+    // The same gate as renderer fetches; the marker is supplied here because the download bypassed webRequest.
+    forward: async url => {
+      const auth = runtime.auth
+      if (!runtime.backend.host || !auth) return new Response(null, { status: 503 })
+      return forwardWebRequest(new Request(url, { headers: { [NATIVE_ACCESS_HEADER]: auth.token } }), auth.url, auth.cookie, auth.token)
+    },
+  })
+  ownedSession.webRequest.onBeforeSendHeaders({ urls: ['<all_urls>'] }, (details, callback) => {
+    const auth = runtime.auth
+    const owner = appWindows.fromContents(details.webContentsId)?.webContents
+    const requestHeaders = appRequestHeaders(details, owner, auth?.token)
+    const target = new URL(details.url)
+    if (target.protocol !== 'ws:' || target.hostname !== '127.0.0.1'
+      || !auth || details.webContentsId !== owner?.id) return callback({ requestHeaders })
+    const host = new URL(auth.url)
+    if (target.host !== host.host) return callback({ requestHeaders })
+    const headers = Object.fromEntries(Object.entries(requestHeaders).map(([key, value]) => [key.toLowerCase(), value]))
+    if (headers.origin !== 'dsh-app://app') return callback({ cancel: true })
+    callback({ requestHeaders: { ...headers, origin: host.origin, cookie: auth.cookie, [NATIVE_ACCESS_HEADER]: auth.token, 'sec-fetch-site': 'same-origin' } })
+  })
+}
+
 async function main(): Promise<void> {
   await app.whenReady()
   if (quitting) return
   let inputRevision = 0
   let inputBlocked = false
-  desktopShortcuts = installDesktopShortcuts(() => mainWindow, app.getPath('userData'),
+  desktopShortcuts = installDesktopShortcuts(() => appWindows.active(), app.getPath('userData'),
     process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux', () => {}, () => {
       const blocked = runtime.recoveryMode || onboardingSurfaceActive
       if (blocked !== inputBlocked) { inputBlocked = blocked; inputRevision++ }
@@ -809,34 +881,21 @@ async function main(): Promise<void> {
   // environment variable, and only Chromium can evaluate it (PAC/WPAD included). Changing the
   // proxy takes effect on the next application start.
   systemProxy = await probeSystemProxy(session.defaultSession)
-  protocol.handle('dsh-app', async request => {
-    const url = new URL(request.url)
-    if (url.hostname === 'shell') {
-      const response = await serveWebDocument(request, join(root, 'lib/native-ui'), false)
-      response.headers.set('content-security-policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-src 'none'; base-uri 'none'")
-      return response
-    }
-    if (url.hostname !== 'app') return new Response(null, { status: 404 })
-    if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname.startsWith('/assets/')
-      || ['/favicon.svg', '/manifest.webmanifest'].includes(url.pathname)) return serveWebDocument(request, webRoot)
-    const auth = runtime.auth
-    if (!runtime.backend.host || !auth) return new Response(null, { status: 503 })
-    return forwardWebRequest(request, auth.url, auth.cookie, auth.token)
-  })
+  configureAppSession(session.defaultSession)
   ipcMain.handle(IPC.boot, async event => {
-    assertSender(event, mainWindow, APP_URL)
+    appWindows.owner(event)
     await runtime.startup
     if (!runtime.backend.host || !runtime.auth) throw new Error('Next Host is unavailable')
     return { injections: await runtime.injections(), streamBaseUrl: new URL(runtime.auth.url).origin }
   })
   ipcMain.handle(IPC.failed, (event, message: unknown) => {
-    assertSender(event, mainWindow, APP_URL)
+    appWindows.owner(event)
     if (typeof message !== 'string') throw new Error('Invalid boot error')
-    runtime.report(new Error(message.slice(0, 4096)))
+    reportWindowFailure(appWindows.owner(event), new Error(message.slice(0, 4096)))
   })
   ipcMain.handle(IPC.state, event => { assertDesktopSender(event); return state() })
   ipcMain.handle('dsh-desktop:setup-onboarding', async (event, request: unknown) => {
-    assertSender(event, mainWindow, APP_URL)
+    appWindows.owner(event)
     if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('Invalid setup request')
     const value = request as { action?: unknown; profile?: unknown; selection?: unknown; active?: unknown }
     if (value.action === 'active') {
@@ -869,19 +928,20 @@ async function main(): Promise<void> {
       features: { market: choice.market === 'community-market', dshMarket: choice.market === 'dsh-market', ...(choice.market === 'official-market' ? { officialMarket: true } : {}), remoteControl: choice.aaEnabled } })
   })
   ipcMain.handle(IPC.settingsTake, event => {
-    assertSender(event, mainWindow, APP_URL)
-    const page = pendingSettings
-    pendingSettings = undefined
+    appWindows.owner(event)
+    const owner = appWindows.owner(event)
+    const page = pendingSettings.get(owner)
+    pendingSettings.delete(owner)
     return page
   })
   ipcMain.handle(IPC.browserLinks, event => { assertDesktopSender(event); return runtime.browserLinks() })
   ipcMain.handle(IPC.browserAcquire, (event, workspace: unknown) => {
-    assertSender(event, mainWindow, APP_URL)
+    appWindows.owner(event)
     if (quitting) throw new Error('Desktop browser is unavailable')
     return browserGuests.acquire(event.sender, workspace)
   })
   ipcMain.handle(IPC.browserRelease, (event, lease: unknown) => {
-    assertSender(event, mainWindow, APP_URL)
+    appWindows.owner(event)
     return browserGuests.release(event.sender, lease)
   })
   ipcMain.handle(IPC.permissionQuery, (event, permission: unknown) => { assertDesktopSender(event); return permissions.query(permission) })
@@ -898,49 +958,26 @@ async function main(): Promise<void> {
   ipcMain.handle(IPC.permissionSettings, async (event, permission: unknown) => {
     await permissionGesture(event); await permissions.openSettings(permission)
   })
-  installMediaPermissions(session.defaultSession, {
-    window: () => mainWindow, language: () => windowsLanguage, warn: error => runtime.diagnostics.append(String(error), 'warn'),
-  })
-  installAppDownloads(session.defaultSession, {
-    window: () => mainWindow, language: () => windowsLanguage, downloads: () => app.getPath('downloads'),
-    warn: error => runtime.diagnostics.append(String(error), 'warn'),
-    // The same gate as renderer fetches; the marker is supplied here because the download bypassed webRequest.
-    forward: async url => {
-      const auth = runtime.auth
-      if (!runtime.backend.host || !auth) return new Response(null, { status: 503 })
-      return forwardWebRequest(new Request(url, { headers: { [NATIVE_ACCESS_HEADER]: auth.token } }), auth.url, auth.cookie, auth.token)
-    },
-  })
-  ipcMain.handle(IPC.material, event => { assertSender(event, mainWindow, APP_URL); return windowMaterial(runtime.preferences) })
-  ipcMain.handle(IPC.command, (event, value: unknown) => { assertDesktopSender(event); return command(value, event.sender === shellWindow?.webContents ? 'shell' : 'app') })
-  let picking: Promise<string | null> | undefined
+  ipcMain.handle(IPC.material, event => { appWindows.owner(event); return windowMaterial(runtime.preferences) })
+  ipcMain.handle(IPC.command, (event, value: unknown) => { assertDesktopSender(event); return command(value, event.sender === shellWindow?.webContents ? 'shell' : 'app', appWindows.fromContents(event.sender.id)) })
+  const picking = new WeakMap<BrowserWindow, Promise<string | null>>()
   ipcMain.handle(IPC.directory, event => {
-    assertSender(event, mainWindow, APP_URL)
-    const window = mainWindow!
+    appWindows.owner(event)
+    const window = appWindows.owner(event)
     show(window)
-    picking ??= dialog.showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
-      .then(result => result.canceled ? null : result.filePaths[0] ?? null).finally(() => { picking = undefined })
-    return picking
-  })
-  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['<all_urls>'] }, (details, callback) => {
-    const auth = runtime.auth
-    const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : undefined
-    const requestHeaders = appRequestHeaders(details, owner, auth?.token)
-    const target = new URL(details.url)
-    if (target.protocol !== 'ws:' || target.hostname !== '127.0.0.1'
-      || !auth || details.webContentsId !== owner?.id) return callback({ requestHeaders })
-    const host = new URL(auth.url)
-    if (target.host !== host.host) return callback({ requestHeaders })
-    const headers = Object.fromEntries(Object.entries(requestHeaders).map(([key, value]) => [key.toLowerCase(), value]))
-    if (headers.origin !== 'dsh-app://app') return callback({ cancel: true })
-    callback({ requestHeaders: { ...headers, origin: host.origin, cookie: auth.cookie, [NATIVE_ACCESS_HEADER]: auth.token, 'sec-fetch-site': 'same-origin' } })
+    const pending = picking.get(window)
+    if (pending) return pending
+    const request = dialog.showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
+      .then(result => result.canceled ? null : result.filePaths[0] ?? null).finally(() => { picking.delete(window) })
+    picking.set(window, request)
+    return request
   })
   ipcMain.on(IPC.nativeThemeSet, (event, source: unknown) => {
-    try { assertSender(event, mainWindow, APP_URL) } catch { return }
+    try { appWindows.owner(event) } catch { return }
     if (source === 'light' || source === 'dark' || source === 'system') nativeTheme.themeSource = source
   })
   ipcMain.on(IPC.locale, (event, language: unknown) => {
-    try { assertSender(event, mainWindow, APP_URL) } catch { return }
+    try { appWindows.owner(event) } catch { return }
     if (typeof language !== 'string' || !/^[a-zA-Z]+(?:-[a-zA-Z0-9]+)*$/u.test(language)) return
     if (!runtime.safeMode) {
       try { nativeLocale.remember(runtime.selected, language) } catch (error) { runtime.diagnostics.append(String(error), 'warn') }
@@ -950,10 +987,10 @@ async function main(): Promise<void> {
     native.refresh()
   })
   ipcMain.handle(IPC.localeRead, event => {
-    assertSender(event, mainWindow, APP_URL)
+    appWindows.owner(event)
     return { languages: [...app.getPreferredSystemLanguages(), app.getLocale()], preference: null }
   })
-  nativeTheme.on('updated', () => { if (mainWindow && !mainWindow.isDestroyed()) applyWindowMaterial(mainWindow, runtime.preferences) })
+  nativeTheme.on('updated', () => { for (const window of appWindows.all) applyWindowMaterial(window, runtime.preferences) })
   runtime.safeMode = safeModeRequested
   runtime.recoveryMode = process.argv.includes(RECOVERY_ARGUMENT)
   runtime.initialize()
@@ -978,15 +1015,14 @@ async function main(): Promise<void> {
   }
   native.createTray()
   updates.start()
-  Menu.setApplicationMenu(process.platform === 'win32' ? null : Menu.buildFromTemplate([
-    { label: 'DSH NEXT', submenu: native.items() }, { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' },
-  ]))
+  if (process.platform === 'win32') Menu.setApplicationMenu(null)
+  else native.refresh()
   if (process.platform === 'win32') {
     ipcMain.handle(IPC.windowsMenu, (event, name: unknown, x: unknown, y: unknown) => {
-      assertSender(event, mainWindow, APP_URL)
+      appWindows.owner(event)
       if ((name !== 'application' && name !== 'edit') || typeof x !== 'number' || typeof y !== 'number'
         || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > 100_000 || y > 100_000) throw new Error('Invalid native menu request')
-      const window = mainWindow!
+      const window = appWindows.owner(event)
       const messages = resolveDesktopLocale(windowsLanguage).messages
       const editItem = (label: string, keyCode: string, modifiers: Array<'control'>, accelerator?: string): MenuItemConstructorOptions => ({
         label, accelerator, click: () => {
@@ -1004,12 +1040,12 @@ async function main(): Promise<void> {
       return new Promise<void>(resolvePopup => { Menu.buildFromTemplate(items).popup({ window, x: Math.round(x * zoom), y: Math.round(y * zoom), callback: resolvePopup }) })
     })
     ipcMain.on(IPC.windowsAppearance, (event, language: unknown, sidebarFill: unknown, symbolColor: unknown) => {
-      try { assertSender(event, mainWindow, APP_URL) } catch { return }
+      try { appWindows.owner(event) } catch { return }
       // Caption paint can run before the official locale service initializes;
       // IPC.locale is the only renderer authority for the application language.
       // The recorded upstream preload still reports its sidebar fill; see WINDOWS_CAPTION_FILL.
       const validColor = (value: unknown): value is string => typeof value === 'string' && /^(?:#[\da-f]{3,8}|rgba?\([\d.,%\s]+\))$/iu.test(value)
-      if (validColor(symbolColor)) mainWindow!.setTitleBarOverlay({ color: WINDOWS_CAPTION_FILL, symbolColor })
+      if (validColor(symbolColor)) appWindows.owner(event).setTitleBarOverlay({ color: WINDOWS_CAPTION_FILL, symbolColor })
     })
   }
   if (runtime.recoveryMode) openControls('recovery')
@@ -1041,7 +1077,7 @@ app.on('before-quit', event => {
     return true
   }
   // Keep disconnection/reconnection chrome out of the quit/relaunch transition.
-  for (const window of [mainWindow, shellWindow]) {
+  for (const window of [...appWindows.all, shellWindow]) {
     if (window && !window.isDestroyed()) window.hide()
   }
   native.close()

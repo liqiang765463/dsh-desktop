@@ -38,19 +38,20 @@ export function installDesktopShortcuts(
   dispose(): void
 } {
   let definitions: readonly ShortcutDefinition[] = []
-  let recording = false
+  const recording = new Set<BrowserWindow>()
   let revision: ShortcutRevision | undefined
   let closeBinding: NormalizedBinding | null = null
   let editingInput: BrowserWindow['webContents'] | undefined
   const scopedDesktop = platform === 'windows' || platform === 'macos'
   const disposers = new Set<() => void>()
+  const windows = new Set<BrowserWindow>()
   const guestInputs = new Map<WebContents, { window: BrowserWindow; reset(): void }>()
   const closeAccelerator = (): string | undefined => presentBinding(closeBinding, platform).aria
     ?.replace('Meta+', 'Command+').replace(/Arrow(Up|Down|Left|Right)$/u, '$1')
   const sendMenuClose = (): void => {
     const window = getWindow()
     if (window === undefined || window.isDestroyed() || !window.isFocused() || !window.isEnabled()
-      || revision === undefined || recording || overlayInput(window).blocked) return
+      || revision === undefined || recording.has(window) || overlayInput(window).blocked) return
     window.webContents.send(DESKTOP_IPC.shortcutsInput, { kind: 'menu', commandId: 'page.close', revision })
   }
   let keys = new Set<string>()
@@ -64,14 +65,13 @@ export function installDesktopShortcuts(
     const close = rows.find(row => row.id === 'page.close')
     closeBinding = close?.issue === null && close.conflicts.length === 0 ? close.binding : null
     if (wasEnabled !== (revision !== undefined) || previousAccelerator !== closeAccelerator()) updateMenu()
-    const window = getWindow()
-    if (window !== undefined && !window.isDestroyed() && window.webContents.mainFrame.url.startsWith('dsh-app://app/')) {
+    for (const window of windows) if (!window.isDestroyed() && window.webContents.mainFrame.url.startsWith('dsh-app://app/')) {
       window.webContents.send(DESKTOP_IPC.shortcutsChanged, snapshot)
     }
   }
   const persistence = desktopKeybindings(userData, platform, publish)
   const assertSender = (event: IpcMainInvokeEvent): BrowserWindow => {
-    const window = getWindow()
+    const window = [...windows].find(window => window.webContents === event.sender)
     if (window === undefined || window.isDestroyed() || event.sender !== window.webContents
       || event.senderFrame !== window.webContents.mainFrame) throw new Error('desktop shortcuts: rejected sender')
     if (!event.senderFrame.url.startsWith(APP_URL)) throw new Error('desktop shortcuts: rejected origin')
@@ -91,12 +91,12 @@ export function installDesktopShortcuts(
   ipcMain.handle(DESKTOP_IPC.shortcutsRecording, (event, active: unknown) => {
     const window = assertSender(event)
     if (typeof active !== 'boolean') throw new Error('desktop shortcuts: invalid recording state')
-    recording = active
+    if (active) recording.add(window); else recording.delete(window)
     window.webContents.setIgnoreMenuShortcuts(active)
   })
   ipcMain.handle(DESKTOP_IPC.shortcutsCloseWindow, (event, expected: unknown) => {
     const window = assertSender(event)
-    if (expected !== revision || revision === undefined || recording || !window.isFocused() || !window.isEnabled()
+    if (expected !== revision || revision === undefined || recording.has(window) || !window.isFocused() || !window.isEnabled()
       || overlayInput(window).blocked) return
     window.close()
   })
@@ -119,8 +119,7 @@ export function installDesktopShortcuts(
     const clear = (): void => {
       resetInput()
       if (guestName !== undefined) return
-      definitions = []; keys.clear(); recording = false
-      persistence.setDefinitions(null)
+      if (windows.size <= 1) { definitions = []; keys.clear(); recording.delete(window); persistence.setDefinitions(null) }
     }
     const navigation = (event: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>): void => {
       if (event.isMainFrame && !event.isSameDocument) clear()
@@ -148,11 +147,11 @@ export function installDesktopShortcuts(
       const match = keys.has(key)
       const menuMatch = closeBinding !== null && closeBinding.secondCode === undefined && modifiers.join('+') === closeBinding.modifiers.join('+')
         && input.key.toUpperCase() === (closeBinding.code.startsWith('Key') ? closeBinding.code.slice(3) : input.code === closeBinding.code ? input.key.toUpperCase() : '')
-      contents.setIgnoreMenuShortcuts(recording || match || menuMatch)
+      contents.setIgnoreMenuShortcuts(recording.has(window) || match || menuMatch)
       const frame = contents.focusedFrame
       const composing = input.isComposing || input.key === 'Dead' || deadKey || input.modifiers.includes('altgr')
       if (input.type === 'keyDown') deadKey = input.key === 'Dead'
-      if (recording || composing || frame === null) { held.clear(); consumed.clear(); return }
+      if (recording.has(window) || composing || frame === null) { held.clear(); consumed.clear(); return }
       let binding: NormalizedBinding = { code: input.code, modifiers }
       let priority = false
       if (scopedDesktop) {
@@ -236,7 +235,7 @@ export function installDesktopShortcuts(
         contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
       } finally {
         editingInput = previous
-        if (!contents.isDestroyed()) contents.setIgnoreMenuShortcuts(recording)
+        if (!contents.isDestroyed()) contents.setIgnoreMenuShortcuts(recording.has(window))
       }
     },
     fileMenu: (labels) => {
@@ -247,7 +246,7 @@ export function installDesktopShortcuts(
         click: sendMenuClose,
       }] }
     },
-    attach(window) { attachInput(window, window.webContents) },
+    attach(window) { windows.add(window); attachInput(window, window.webContents); window.once('closed', () => { windows.delete(window); recording.delete(window) }) },
     attachGuest: attachInput,
     dispose() {
       for (const dispose of disposers) dispose()

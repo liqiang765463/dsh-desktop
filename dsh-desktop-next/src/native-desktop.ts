@@ -37,8 +37,13 @@ export class NativeDesktop {
   }
   items() { return desktopMenu(this.options.state(), this.options.language(), this.options.show, this.options.run) }
   refresh(): void {
+    const zh = this.options.language().toLowerCase().startsWith('zh')
     if (process.platform !== 'win32') Menu.setApplicationMenu(Menu.buildFromTemplate([
-      { label: 'DSH NEXT', submenu: this.items() }, { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' },
+      { label: 'DSH NEXT', submenu: this.items() }, { role: 'editMenu' }, { role: 'viewMenu' },
+      { role: 'windowMenu', submenu: [
+        { label: zh ? '新建独立窗口' : 'New Independent Window', accelerator: 'CmdOrCtrl+Shift+N', click: () => this.options.run({ type: 'new-window' }) },
+        { type: 'separator' }, { role: 'minimize' }, { role: 'zoom' }, { type: 'separator' }, { role: 'front' },
+      ] },
     ]))
     if (!this.available) return
     const state = this.options.state()
