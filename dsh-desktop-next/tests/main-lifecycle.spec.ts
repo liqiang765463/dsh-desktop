@@ -9,6 +9,9 @@ import { NextProfiles } from '../src/profiles.ts'
 import { NextRecovery } from '../src/recovery.ts'
 
 const originalMonitors = new Set(process.listeners('uncaughtExceptionMonitor'))
+vi.mock('../src/window-control.ts', async importOriginal => ({ ...await importOriginal<typeof import('../src/window-control.ts')>(),
+  WindowControlServer: class { async listen() {} close() {} },
+}))
 afterEach(() => { for (const listener of process.listeners('uncaughtExceptionMonitor')) if (!originalMonitors.has(listener)) process.off('uncaughtExceptionMonitor', listener) })
 
 const fixture = vi.hoisted(() => ({
@@ -1150,4 +1153,23 @@ it('reconnects every window only after an explicitly confirmed shared Host resta
     expect(first.loadedUrls).toHaveLength(2)
     expect(second.loadedUrls).toHaveLength(2)
   } finally { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
+})
+
+it('keeps official binary updates from silently replacing task-bound window features in a packaged build', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'next-window-upgrade-'))
+  vi.stubEnv('DSH_DESKTOP_NEXT_HOME', home)
+  const { app, dialog } = await import('electron')
+  const descriptor = Object.getOwnPropertyDescriptor(app, 'isPackaged')
+  try {
+    await import('../src/main.ts')
+    await vi.waitFor(() => expect(fixture.windows).toHaveLength(1))
+    Object.defineProperty(app, 'isPackaged', { configurable: true, value: true })
+    const window = fixture.windows[0], sender = { sender: window.webContents, senderFrame: window.webContents.mainFrame }
+    await fixture.handlers.get('dsh-next:command')!(sender, { type: 'install-update' })
+    expect(dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.stringContaining('dsh-next-upgrade') }))
+    expect(app.quit).not.toHaveBeenCalled(); expect(fixture.close).not.toHaveBeenCalled()
+  } finally {
+    if (descriptor) Object.defineProperty(app, 'isPackaged', descriptor); else delete (app as any).isPackaged
+    vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true })
+  }
 })

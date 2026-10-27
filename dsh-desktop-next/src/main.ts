@@ -1,4 +1,6 @@
 import { ApplicationWindows } from './app-windows.ts'
+import { WindowIdentities, type WindowIdentity } from './window-identities.ts'
+import { WindowControl, WindowControlServer, windowControlPath } from './window-control.ts'
 /** Official Desktop transport with a Host-independent native shell. */
 import { installDesktopShortcuts } from './keyboard.ts'
 import { spawn } from 'node:child_process'
@@ -85,6 +87,9 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'dsh-app', privileges: {
 } }])
 
 const appWindows = new ApplicationWindows<BrowserWindow>()
+const windowIdentities = new WindowIdentities(join(home, 'desktop-windows.json'))
+const windowIdentity = new WeakMap<BrowserWindow, WindowIdentity>()
+let windowControlServer: WindowControlServer | undefined
 const configuredAppSessions = new WeakSet<Electron.Session>()
 let mainWindow: BrowserWindow | undefined
 // Storage partitions outlive individual windows, so the guest owner is process-scoped.
@@ -368,15 +373,23 @@ function openMain(): void {
   if (runtime.recoveryMode || runtime.state().phase === 'error') { openControls('recovery'); return }
   const existing = appWindows.active()
   if (existing) { show(existing); return }
-  openApplicationWindow()
+  openApplicationWindow(windowIdentities.first())
 }
 
-function openApplicationWindow(): void {
+function windowTitle(owner: BrowserWindow, identity: WindowIdentity, title: string): string {
+  const current = windowIdentities.find(identity.id)!
+  return `${title} · ${t('窗口', 'Window')} ${current.slot + 1} · ${current.id.slice(0, 8)}${current.owner ? ` · Codex ${current.owner.slice(-6)}` : ''}`
+}
+function openApplicationWindow(requested?: WindowIdentity): BrowserWindow | undefined {
   if (quitting || runtime.recoveryMode || (runtime.busy && appWindows.all.length > 0) || (onboarding && appWindows.all.length > 0)) return
-  const slot = appWindows.nextSlot()
+  const identity = requested ?? windowIdentities.create()
+  const existing = appWindows.all.find(window => windowIdentity.get(window)?.id === identity.id)
+  if (existing) return existing
+  const slot = identity.slot
   const owner = createWindow('preload-app.cjs', true, slot)
+  windowIdentity.set(owner, identity)
   appWindows.add(owner, slot)
-  owner.webContents.on('page-title-updated', (event, title) => { event.preventDefault(); owner.setTitle(`${title} · ${t('窗口', 'Window')} ${slot + 1}`) })
+  owner.webContents.on('page-title-updated', (event, title) => { event.preventDefault(); owner.setTitle(windowTitle(owner, identity, title)) })
   mainWindow ??= owner
   // The guest owner installs its own navigation, crash and destruction release paths.
   browserGuests.bind(owner, (guest, name) => desktopShortcuts!.attachGuest(owner, guest, name))
@@ -388,6 +401,7 @@ function openApplicationWindow(): void {
     if (isMain && code !== -3 && !quitting && appWindows.all.includes(owner) && !owner.isDestroyed()) reportWindowFailure(owner, new Error(message))
   })
   void loadMainDocument(owner).catch(error => reportWindowFailure(owner, error))
+  return owner
 }
 /** Renderer failures belong to their window; they do not stop the shared Host or other renderers. */
 function reportWindowFailure(owner: BrowserWindow, error: unknown): void {
@@ -475,7 +489,7 @@ async function promptAvailableUpdate(): Promise<void> {
     detail: t('下载完成后可一键安装并重启。', 'When the download finishes, choose Install and restart.'),
   }
   const choice = await (owner === undefined ? dialog.showMessageBox(options) : dialog.showMessageBox(owner, options))
-  if (choice.response === 0 && !quitting && !runtime.busy) void updates.download()
+  if (choice.response === 0 && !quitting && !runtime.busy) void command({ type: 'download-update' }, 'native')
 }
 async function openPath(path: string): Promise<void> { const error = await shell.openPath(path); if (error) throw new Error(error) }
 
@@ -504,6 +518,12 @@ async function loggedCommand(input: Record<string, unknown>, type: string, sourc
 
 async function performCommand(input: Record<string, unknown>, type: string, source: 'app' | 'shell' | 'native', owner?: BrowserWindow): Promise<void> {
   if (type === 'new-window') { openApplicationWindow(); return }
+  if (app.isPackaged && (type === 'download-update' || type === 'install-update')) {
+    await dialog.showMessageBox({ type: 'info', title: 'DSH NEXT',
+      message: t('此版本包含固定窗口与任务绑定，请使用保留改动的升级入口。', 'This build has task-bound windows. Use the feature-preserving upgrade procedure.'),
+      detail: t('直接安装官方包会移除这些能力。请运行 dsh-next-upgrade 准备合并、测试及回滚包；当前程序保持不变。', 'An official package would remove these features. Run dsh-next-upgrade to prepare the merge, tests and rollback package. This application stays unchanged.') })
+    return
+  }
   if (type === 'controls') {
     if (input.page !== undefined && (typeof input.page !== 'string' || !['general', 'profiles', 'create-profile', 'tools', 'recovery', 'permissions'].includes(input.page))) throw new Error('Invalid controls page')
     openControls(input.page as Parameters<typeof openControls>[0], owner); return
@@ -1061,12 +1081,24 @@ async function main(): Promise<void> {
   else { void runtime.start().catch(() => {}); openMain() }
   app.on('activate', openMain)
   app.on('window-all-closed', () => { if (process.platform !== 'darwin' && !native.available && !replacingWindow) app.quit() })
+  const controlPath = windowControlPath(home)
+  privateDirectory(dirname(controlPath))
+  windowControlServer = new WindowControlServer(controlPath, new WindowControl(windowIdentities, identity => {
+    const window = openApplicationWindow(identity)
+    if (!window) throw new Error('Window control is unavailable during startup, recovery or a shared operation')
+    return window
+  }, identity => {
+    const window = appWindows.all.find(window => windowIdentity.get(window)?.id === identity.id)
+    if (window) window.setTitle(windowTitle(window, identity, window.webContents.getTitle?.() ?? 'DSH NEXT'))
+  }))
+  await windowControlServer.listen()
 }
 
 app.on('before-quit', event => {
   if (quitting || !ownsInstance) return
   event.preventDefault()
   quitting = true
+  windowControlServer?.close()
   runtime.diagnostics.record({ source: 'electron', event: 'shutdown.start' })
   runtime.diagnostics.flush()
   // Bound the whole shutdown, including cleanup before Host termination starts.

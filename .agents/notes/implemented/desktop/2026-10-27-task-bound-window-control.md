@@ -1,0 +1,7 @@
+# Task-bound DSH window control and forward-porting
+
+The owner explicitly asked for two Codex tasks to stay in their own windows and preserve the changes during upgrades. Window state isolation alone was insufficient: the previous app-wide CUA menu selection could still choose another window. Persistent UUID/slot/owner records now survive restart, and a scoped CLI derives identity from the Codex task environment. A private local Unix socket routes a bounded action set to the exact BrowserWindow without OS input or focus. Cross-window IDs, another window's observations and reused/stale controls are refused. Per-owner queues preserve action ordering, while independent owners proceed separately.
+
+This is a tool boundary for cooperative Codex tasks, not a sandbox against a same-user process with arbitrary shell/Computer Use privileges. Keep DSH automation on the scoped CLI; unsupported native surfaces must not fall back to global clicks. No actor impersonation option, general eval, password input, external navigation or app-global quit/restart is exposed.
+
+The upgrade entry exports the reviewed feature diff with a SHA manifest, applies it in an isolated upstream checkout and stops on conflicts/dependency/check failures. Official binary replacement in the customized app is guarded. User data, window identities and partitions remain outside the application bundle. See WINDOW-CONTROL.md for the contract and actual acceptance records for native results.
